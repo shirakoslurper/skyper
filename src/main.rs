@@ -1,12 +1,15 @@
+use clap::Parser;
 use ethers::prelude::*;
 use ethers::{
     core::{types::TransactionRequest, utils::Anvil},
     middleware::SignerMiddleware,
     providers::{Http, Middleware, Provider},
-    signers::{LocalWallet, Signer},
+    signers::{coins_bip39::English, Signer},
 };
 use futures::{stream, Stream, StreamExt, TryStream, TryStreamExt};
 use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
 
 // const JSON_RPC_URL: &str = "https://mainnet.sanko.xyz";
 const WS_RPC_URL: &str = "wss://mainnet.sanko.xyz/ws";
@@ -19,32 +22,51 @@ enum EventType {
     Mint(Log)
 }
 
+#[derive(Parser, Debug)]
+struct Config {
+    #[clap(short = 'm', long)]
+    mnemonic_dir: PathBuf,
+    #[clap(short = 'w', long, default_value = "wss://mainnet.sanko.xyz/ws")]
+    ws_rpc_url: String,
+    #[clap(short = 'u', long, default_value = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f")]
+    uni_v2_pool_factory_address: String,
+    #[clap(short = 'b', long, default_value = "0x754cDAd6f5821077d6915004Be2cE05f93d176f8")]
+    base_coin_address: String,
+    #[clap(short = 'c', long, default_value = "1996")]
+    chain_id: u64
+}
+
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
 
+    let config = Config::parse();
+
     // WALLET
-    let anvil = Anvil::new().spawn();
-    let wallet: LocalWallet = anvil.keys()[0].clone().into();
+    let wallet = MnemonicBuilder::<English>::default()
+        .phrase(config.mnemonic_dir)
+        .index(0u32)?
+        .build()?;
+    println!("wallet: {:?}", wallet);
+
 
     // CONNECT TO NETWORKS
     let provider = Provider::<Ws>::connect(WS_RPC_URL).await?;
 
     // // CONNECT WALLET TO PROVIDER
-    // let client = SignerMiddleware::new(provider, wallet.wit)
+    let client = SignerMiddleware::new(provider.clone(), wallet.with_chain_id(config.chain_id));
 
     // QUICK BLOCK NUMBER CHECK
     let block_number: U64 = provider.get_block_number().await?;
     println!("{block_number}");
 
     // PAIRCREATED AND MINT FILTERS
-    let camelot_pool_factory_address = CAMELOT_POOL_FACTORY_ADDRESS.parse::<H160>()?;
-
     let token_topics = [
-        H256::from(WDMT_ADDRESS.parse::<Address>()?)
+        H256::from(config.base_coin_address.parse::<Address>()?)
     ];
 
     let pair_created_filter = Filter::new()
-        .address(CAMELOT_POOL_FACTORY_ADDRESS.parse::<Address>()?)
+        .address(config.uni_v2_pool_factory_address.parse::<Address>()?)
         .event("PairCreated(address,address,adress,uint256)")
         .topic1(token_topics.to_vec())
         .topic2(token_topics.to_vec());
@@ -60,7 +82,6 @@ async fn main() -> eyre::Result<()> {
         pair_created_stream,
         mint_stream,
     ]);
-
 
     // PAIR SET (REMOVED UPON FIRST LIQUIDITY)
     let mut pair_address_set = HashSet::new();
