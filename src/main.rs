@@ -8,9 +8,9 @@ use ethers::{
 };
 use futures::{stream, Stream, StreamExt, TryStream, TryStreamExt};
 use std::collections::HashSet;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // const JSON_RPC_URL: &str = "https://mainnet.sanko.xyz";
 const WS_RPC_URL: &str = "wss://mainnet.sanko.xyz/ws";
@@ -80,6 +80,23 @@ abigen!(
     ]"#,
 );
 
+// EXECUTION
+abigen!(
+    UniswapV2Router02,
+    r#"[
+        function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB)
+        function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external pure returns (uint amountOut)
+        function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) external pure returns (uint amountIn)
+        function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)
+        function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts)
+        function removeLiquidityETHSupportingFeeOnTransferTokens(address token, uint liquidity, uint amountTokenMin, uint amountETHMin, address to, uint deadline) external returns (uint amountETH)
+        function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(address token, uint liquidity, uint amountTokenMin, uint amountETHMin, address to, uint deadline, bool approveMax, uint8 v, bytes32 r, bytes32 s) external returns (uint amountETH)
+        function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external
+        function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable
+        function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external
+    ]"#
+);
+
 #[derive(Clone, Debug)]
 enum EventType {
     PairCreated(Log),
@@ -92,10 +109,12 @@ struct Config {
     mnemonic_dir: PathBuf,
     #[clap(short = 'w', long, default_value = "wss://mainnet.sanko.xyz/ws")]
     ws_rpc_url: String,
-    #[clap(short = 'u', long, default_value = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f")]
+    #[clap(short = 'p', long, default_value = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f")]
     uni_v2_pool_factory_address: String,
+    #[clap(short = 'r', long, default_value = "0x18E621B64d7808c3C47bccbbD7485d23F257D26f")]
+    uni_v2_router_address: String,
     #[clap(short = 'b', long, default_value = "0x754cDAd6f5821077d6915004Be2cE05f93d176f8")]
-    base_coin_address: String,
+    wrapped_base_coin_address: String,
     #[clap(short = 'c', long, default_value = "1996")]
     chain_id: u64
 }
@@ -113,7 +132,6 @@ async fn main() -> eyre::Result<()> {
         .build()?;
     println!("wallet: {:?}", wallet);
 
-
     // CONNECT TO NETWORKS
     let provider = Arc::new(Provider::<Ws>::connect(WS_RPC_URL).await?);
 
@@ -125,13 +143,18 @@ async fn main() -> eyre::Result<()> {
     println!("{block_number}");
 
     // BASE COIN DETAILS
-    let base_coin_address = config.base_coin_address.parse::<Address>()?;
-    let base_coin_contract = ERC20Contract::new(base_coin_address, client.clone());
-    let base_coin_decimals = base_coin_contract.decimals().call().await?;
+    let wrapped_base_coin_address = config.wrapped_base_coin_address.parse::<Address>()?;
+    let wrapped_base_coin_contract = ERC20Contract::new(wrapped_base_coin_address, client.clone());
+    let wrapped_base_coin_decimals = wrapped_base_coin_contract.decimals().call().await?;
+    // let wrapped_base_coin_symbol = wrapped_base_coin_contract.symbol().call().await?;
+    
+    // UNI V2 ROUTER DETAILS
+    let uni_v2_router_address = config.uni_v2_router_address.parse::<Address>()?;
+    let uni_v2_router_contract = UniswapV2Router02::new(uni_v2_router_address, client.clone());
 
     // PAIRCREATED AND MINT FILTERS
     let token_topics = [
-        H256::from(base_coin_address)
+        H256::from(wrapped_base_coin_address)
     ];
 
     let pair_created_filter = Filter::new()
@@ -161,6 +184,14 @@ async fn main() -> eyre::Result<()> {
     // PAIR SET (REMOVED UPON FIRST LIQUIDITY)
     let mut pair_address_set = HashSet::new();
 
+
+    // VALIDATION
+    let wallet_base_coin_balance = client
+        .get_balance(client.address(), None)
+        .await?;
+
+    println!("wallet_base_coin_balance: {}", wallet_base_coin_balance);
+
     // EVENT HANDLING LOOP
     while let Some(event) = combined_stream.next().await {
         println!("{:#?}", event);
@@ -176,9 +207,9 @@ async fn main() -> eyre::Result<()> {
 
                 println!("Mint:\n    pair_address: {}", pair_address);
 
-                if pair_address_set.remove(&pair_address) {
+                // if pair_address_set.remove(&pair_address) {
 
-                    // TODO: Check the pool for the coins
+                    // PARSE MINT AMOUNTS IN
                     let sender_address = Address::from(log.topics[1]);
     
                     let amount_0 = U256::from_big_endian(&log.data[0..32]);
@@ -201,35 +232,88 @@ async fn main() -> eyre::Result<()> {
                     // We're subscribed to all Mint events so neither 
                     // token is guaranteed to be our base coin
                     // If/else over match for simplicity (no new scope)
-                    let base_coin_amount = if base_coin_address == token_0 {
-                        amount_0
-                    } else if base_coin_address == token_1 {
-                        amount_1
+                    let (base_coin_amount, other_coin_address) = if wrapped_base_coin_address == token_0 {
+                        (amount_0, token_1)
+                    } else if wrapped_base_coin_address == token_1 {
+                        (amount_1, token_0)
                     } else {
                         continue;
                     };
                     
                     // CHECK MINIMUM AMOUNT OF BASE COIN RESERVES
-                    if base_coin_amount > U256::from(10) * base_coin_decimals {
+                    // if base_coin_amount > U256::from(10) * base_coin_decimals {
 
                         // BET SIZING
-                        let base_coin_amount_in_wallet = base_coin_contract
-                        .balance_of(client.address())
-                        .call()
+                        // let wallet_base_coin_balance = base_coin_contract
+                        // .balance_of(client.address())
+                        // .call()
+                        // .await?;
+
+                        // println!("wallet_base_coin_balance: {}", wallet_base_coin_balance);
+
+                        let wallet_base_coin_balance = client
+                        .get_balance(client.address(), None)
                         .await?;
+                
+                        println!("wallet_base_coin_balance: {}", wallet_base_coin_balance);
 
-                        let bet_amount = base_coin_amount_in_wallet / 20;
-                        
-                        
+                        let base_coin_amount_in = wallet_base_coin_balance / 20;
 
+                        // BASE COIN DOES NOT NEED TO BE APPROVED
+                        // // APPROVE ROUTER TO USE BASE COIN
+                        // let approve_receipt = base_coin_contract
+                        //     .approve(uni_v2_router_address, base_coin_amount_in)
+                        //     .send()
+                        //     .await?
+                        //     .await?
+                        //     .expect("approve() failed: no receipt found");
 
+                        // println!("Router {} approved to trade for {}!\nreceipt: {:?}", uni_v2_router_address, other_coin_address, approve_receipt);
 
-                    }
+                        // SWAP THROUGH ROUTER
+                        let amounts_out = uni_v2_router_contract
+                            .get_amounts_out(
+                                base_coin_amount_in,
+                                vec![wrapped_base_coin_address, other_coin_address]
+                            )
+                            .call()
+                            .await?;
 
-                }
+                        println!("{:?}", amounts_out);
+
+                        let deadline = U256::from(get_epoch_milliseconds()) + U256::from(60 * 1000);
+
+                        println!("{:?}", deadline);
+
+                        let swap_receipt = uni_v2_router_contract
+                            .swap_exact_eth_for_tokens_supporting_fee_on_transfer_tokens(
+                                amounts_out[1]/2, 
+                                vec![wrapped_base_coin_address, other_coin_address], 
+                                client.address(), 
+                                deadline
+                            )
+                            .value(base_coin_amount_in)
+                            .from(client.address())
+                            .gas(U256::from(1_000_000))
+                            .send()
+                            .await?
+                            .await?
+                            .expect("swapExactEthForTokensSupportingFeeOnTransferTokens() failed: no receipt found");
+
+                        println!("Router {} swapped for {}!\nreceipt: {:?}", uni_v2_router_address, other_coin_address, swap_receipt);
+                    // }
+
+                // }
             }
         }
     }
 
     Ok(())
+}
+
+fn get_epoch_milliseconds() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
