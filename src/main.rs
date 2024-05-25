@@ -12,13 +12,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// const JSON_RPC_URL: &str = "https://mainnet.sanko.xyz";
-const WS_RPC_URL: &str = "wss://mainnet.sanko.xyz/ws";
-const CAMELOT_POOL_FACTORY_ADDRESS: &str = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f";
+const CAMELOT_POOL_FACTORY_ADDRESS: &str = "0x7d8c6B58BA2d40FC6E34C25f9A488067Fe0D2dB4";
+const CAMELOT_ROUTER_ADDRESS: &str = "0x18E621B64d7808c3C47bccbbD7485d23F257D26f";
 const WDMT_ADDRESS: &str = "0x754cDAd6f5821077d6915004Be2cE05f93d176f8";
+const SANKO_CHAIN_ID: u64 = 1996;
+const SANKO_WS_RPC_URL: &str = "wss://mainnet.sanko.xyz/ws";
 
 abigen!(
-    UniswapV2Pair,
+    CamelotPair,
     r#"[
         event Approval(address indexed owner, address indexed spender, uint value)
         event Transfer(address indexed from, address indexed to, uint value)
@@ -80,12 +81,8 @@ abigen!(
     ]"#,
 );
 
-// EXECUTION
-// EDITES TO MATCH CAMELOT (REFERRER FIELD)
-// TODO: SWITCH UP ABIS PER CHAIN?
-// BUT RLY DO I ENTEND TO USE THIS FOR ANYTHING ELSE LMAOOO
 abigen!(
-    UniswapV2Router02,
+    CamelotRouter,
     r#"[
         function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB)
         function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external pure returns (uint amountOut)
@@ -100,21 +97,6 @@ abigen!(
     ]"#
 );
 
-// abigen!(
-//     CamelotRouter,
-//     r#"[
-//         function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB)
-//         function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external pure returns (uint amountOut)
-//         function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) external pure returns (uint amountIn)
-//         function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)
-//         function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts)
-//         function removeLiquidityETHSupportingFeeOnTransferTokens(address token, uint liquidity, uint amountTokenMin, uint amountETHMin, address to, uint deadline) external returns (uint amountETH)
-//         function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(address token, uint liquidity, uint amountTokenMin, uint amountETHMin, address to, uint deadline, bool approveMax, uint8 v, bytes32 r, bytes32 s) external returns (uint amountETH)
-//         function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, address referrer, uint deadline) external
-//         function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] calldata path, address to, address referrer, uint deadline) external payable
-//         function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, address referrer, uint deadline) external
-//     ]"#
-// );
 
 #[derive(Clone, Debug)]
 enum EventType {
@@ -128,12 +110,6 @@ struct Config {
     mnemonic_dir: PathBuf,
     #[clap(short = 'w', long, default_value = "wss://mainnet.sanko.xyz/ws")]
     ws_rpc_url: String,
-    #[clap(short = 'p', long, default_value = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f")]
-    uni_v2_pool_factory_address: String,
-    #[clap(short = 'r', long, default_value = "0x18E621B64d7808c3C47bccbbD7485d23F257D26f")]
-    uni_v2_router_address: String,
-    #[clap(short = 'b', long, default_value = "0x754cDAd6f5821077d6915004Be2cE05f93d176f8")]
-    wrapped_base_coin_address: String,
     #[clap(short = 'c', long, default_value = "1996")]
     chain_id: u64
 }
@@ -152,7 +128,7 @@ async fn main() -> eyre::Result<()> {
     println!("wallet: {:?}", wallet);
 
     // CONNECT TO NETWORKS
-    let provider = Arc::new(Provider::<Ws>::connect(WS_RPC_URL).await?);
+    let provider = Arc::new(Provider::<Ws>::connect(config.ws_rpc_url).await?);
 
     // // CONNECT WALLET TO PROVIDER
     let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(config.chain_id)));
@@ -162,25 +138,25 @@ async fn main() -> eyre::Result<()> {
     println!("{block_number}");
 
     // BASE COIN DETAILS
-    let wrapped_base_coin_address = config.wrapped_base_coin_address.parse::<Address>()?;
-    let wrapped_base_coin_contract = ERC20Contract::new(wrapped_base_coin_address, client.clone());
-    let wrapped_base_coin_decimals = wrapped_base_coin_contract.decimals().call().await?;
+    let wdmt_address = WDMT_ADDRESS.parse::<Address>()?;
+    let wdmt_contract = ERC20Contract::new(wdmt_address, client.clone());
+    let wdmt_decimals = wdmt_contract.decimals().call().await?;
     // let wrapped_base_coin_symbol = wrapped_base_coin_contract.symbol().call().await?;
     
-    // UNI V2 ROUTER DETAILS
-    let uni_v2_router_address = config.uni_v2_router_address.parse::<Address>()?;
-    let uni_v2_router_contract = UniswapV2Router02::new(uni_v2_router_address, client.clone());
+    // CAMELOT ROUTER DETAILS
+    let camelot_router_address = CAMELOT_ROUTER_ADDRESS.parse::<Address>()?;
+    let camelot_router_contract = CamelotRouter::new(camelot_router_address, client.clone());
 
     // PAIRCREATED AND MINT FILTERS
-    let token_topics = [
-        H256::from(wrapped_base_coin_address)
-    ];
+    // let token_topics = [
+    //     H256::from(wdmt_address)
+    // ];
 
     let pair_created_filter = Filter::new()
-        .address(config.uni_v2_pool_factory_address.parse::<Address>()?)
-        .event("PairCreated(address,address,adress,uint256)")
-        .topic1(token_topics.to_vec())
-        .topic2(token_topics.to_vec());
+        .address(CAMELOT_POOL_FACTORY_ADDRESS.parse::<Address>()?)
+        .event("PairCreated(address,address,address,uint256)");
+        // .topic1(token_topics.to_vec())
+        // .topic2(token_topics.to_vec());
 
     let mint_filter = Filter::new()
         .event("Mint(address,uint256,uint256)");
@@ -203,22 +179,31 @@ async fn main() -> eyre::Result<()> {
     // PAIR SET (REMOVED UPON FIRST LIQUIDITY)
     let mut pair_address_set = HashSet::new();
 
-
-    // VALIDATION
-    let wallet_base_coin_balance = client
+    // VALIDATION AND CHECK
+    let wallet_dmt_balance = client
         .get_balance(client.address(), None)
         .await?;
 
-    println!("wallet_base_coin_balance: {}", wallet_base_coin_balance);
+    println!("wallet_dmt_balance: {}", wallet_dmt_balance);
 
     // EVENT HANDLING LOOP
     while let Some(event) = combined_stream.next().await {
         println!("{:#?}", event);
 
+        // 00000_00000_00000_00000_0000
+        // 00_00_00_00_00_00_00_00_00_00_00_00
+        // 12 bytes!
+
+        // b6_13_d6_4d_65_62_6d_16_97_69_65_d6_20_fc_61_ef_54_ca_6b_82
+
         match event {
             EventType::PairCreated(log) => {
-                let pair_address = Address::from(&log.data[40..60].try_into()?);
+                let pair_address = Address::from(&log.data[12..32].try_into()?);
+
+
                 println!("PairCreated:\n    pair_address: {}", pair_address);
+
+
                 pair_address_set.insert(pair_address);
             },
             EventType::Mint(log) => {
@@ -240,7 +225,7 @@ async fn main() -> eyre::Result<()> {
                     // Find which amount is the base coin
                     
                     // PAIR CONTRACT
-                    let pair_contract = UniswapV2Pair::new(pair_address, client.clone());
+                    let pair_contract = CamelotPair::new(pair_address, client.clone());
 
                     let token_0 = Address::from(pair_contract.token_0().call().await?);
                     println!("token0: {:?}", token_0);
@@ -251,9 +236,9 @@ async fn main() -> eyre::Result<()> {
                     // We're subscribed to all Mint events so neither 
                     // token is guaranteed to be our base coin
                     // If/else over match for simplicity (no new scope)
-                    let (base_coin_amount, other_coin_address) = if wrapped_base_coin_address == token_0 {
+                    let (dmt_amount, other_coin_address) = if wdmt_address == token_0 {
                         (amount_0, token_1)
-                    } else if wrapped_base_coin_address == token_1 {
+                    } else if wdmt_address == token_1 {
                         (amount_1, token_0)
                     } else {
                         continue;
@@ -270,30 +255,19 @@ async fn main() -> eyre::Result<()> {
 
                         // println!("wallet_base_coin_balance: {}", wallet_base_coin_balance);
 
-                        let wallet_base_coin_balance = client
+                        let wallet_dmt_balance = client
                         .get_balance(client.address(), None)
                         .await?;
                 
-                        println!("wallet_base_coin_balance: {}", wallet_base_coin_balance);
+                        println!("wallet_base_coin_balance: {}", wallet_dmt_balance);
 
-                        let base_coin_amount_in = wallet_base_coin_balance / 20;
-
-                        // BASE COIN DOES NOT NEED TO BE APPROVED
-                        // // APPROVE ROUTER TO USE BASE COIN
-                        // let approve_receipt = base_coin_contract
-                        //     .approve(uni_v2_router_address, base_coin_amount_in)
-                        //     .send()
-                        //     .await?
-                        //     .await?
-                        //     .expect("approve() failed: no receipt found");
-
-                        // println!("Router {} approved to trade for {}!\nreceipt: {:?}", uni_v2_router_address, other_coin_address, approve_receipt);
+                        let dmt_amount_in = wallet_dmt_balance / 20;
 
                         // SWAP THROUGH ROUTER
-                        let amounts_out = uni_v2_router_contract
+                        let amounts_out = camelot_router_contract
                             .get_amounts_out(
-                                base_coin_amount_in,
-                                vec![wrapped_base_coin_address, other_coin_address]
+                                dmt_amount_in,
+                                vec![wdmt_address, other_coin_address]
                             )
                             .call()
                             .await?;
@@ -304,15 +278,15 @@ async fn main() -> eyre::Result<()> {
 
                         println!("{:?}", deadline);
 
-                        let swap_receipt = uni_v2_router_contract
+                        let swap_receipt = camelot_router_contract
                             .swap_exact_eth_for_tokens_supporting_fee_on_transfer_tokens(
                                 amounts_out[1]/2, 
-                                vec![wrapped_base_coin_address, other_coin_address], 
+                                vec![wdmt_address, other_coin_address], 
                                 client.address(), 
                                 client.address(),
                                 deadline
                             )
-                            .value(base_coin_amount_in)
+                            .value(dmt_amount_in)
                             .from(client.address())
                             .gas(U256::from(1_000_000))
                             .send()
@@ -320,7 +294,7 @@ async fn main() -> eyre::Result<()> {
                             .await?
                             .expect("swapExactEthForTokensSupportingFeeOnTransferTokens() failed: no receipt found");
 
-                        println!("Router {} swapped for {}!\nreceipt: {:?}", uni_v2_router_address, other_coin_address, swap_receipt);
+                        println!("Router {} swapped for {}!\nreceipt: {:?}", camelot_router_address, other_coin_address, swap_receipt);
                     // }
 
                 // }
