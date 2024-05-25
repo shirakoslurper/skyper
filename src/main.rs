@@ -1,4 +1,6 @@
 use clap::Parser;
+use ethers::core::k256::ecdsa::SigningKey;
+use ethers::core::k256::Secp256k1;
 use ethers::prelude::*;
 use ethers::{
     core::{types::TransactionRequest, utils::Anvil},
@@ -6,8 +8,8 @@ use ethers::{
     providers::{Http, Middleware, Provider},
     signers::{coins_bip39::English, Signer},
 };
-use futures::{stream, Stream, StreamExt, TryStream, TryStreamExt};
-use std::collections::HashSet;
+use futures::{stream, StreamExt};
+use std::collections::{HashSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -186,120 +188,164 @@ async fn main() -> eyre::Result<()> {
 
     println!("wallet_dmt_balance: {}", wallet_dmt_balance);
 
+    // MIN DMT RESERVES
+    let min_dmt_reserve = U256::from(10) * U256::from(wdmt_decimals);
+
+    let mut pair_created_pair_address_set = HashSet::new();
+    let mut pair_address_to_mint_details = HashMap::new();
+
     // EVENT HANDLING LOOP
     while let Some(event) = combined_stream.next().await {
         println!("{:#?}", event);
 
-        // 00000_00000_00000_00000_0000
-        // 00_00_00_00_00_00_00_00_00_00_00_00
-        // 12 bytes!
-
-        // b6_13_d6_4d_65_62_6d_16_97_69_65_d6_20_fc_61_ef_54_ca_6b_82
-
         match event {
             EventType::PairCreated(log) => {
+                // 12 empty bytes at start
                 let pair_address = Address::from(&log.data[12..32].try_into()?);
-
-
+                
                 println!("PairCreated:\n    pair_address: {}", pair_address);
 
-
                 pair_address_set.insert(pair_address);
+
+                if let Some(mint_details) = pair_address_to_mint_details.remove(&pair_address) {
+                    // MAKE_TRADE WITH MINT INFO THAT SNUCK IN AHEAD
+                    trade_dmt_for_other(
+                        &client, 
+                        wdmt_address,
+                        wdmt_decimals,
+                        &camelot_router_contract,
+                        min_dmt_reserve,
+                        pair_address, 
+                        mint_details
+                    ).await?;
+                } else {
+                    // PLACE IN pair_created_pair_address_set FOR
+                    // FOLLOWING MINT TO REFER TO
+                    pair_created_pair_address_set.insert(pair_address);
+                }
             },
             EventType::Mint(log) => {
                 let pair_address = log.address;
 
                 println!("Mint:\n    pair_address: {}", pair_address);
 
-                // if pair_address_set.remove(&pair_address) {
+                let amount_0 = U256::from_big_endian(&log.data[0..32]);
+                let amount_1 = U256::from_big_endian(&log.data[32..64]);
 
-                    // PARSE MINT AMOUNTS IN
-                    let sender_address = Address::from(log.topics[1]);
-    
-                    let amount_0 = U256::from_big_endian(&log.data[0..32]);
-                    let amount_1 = U256::from_big_endian(&log.data[32..64]);
-    
-                    println!("    sender: {}\n    amount_0: {}\n    amount_1: {}", sender_address, amount_0, amount_1);
-                    
-                    // Buy if it meets liquidity criteria!
-                    // Find which amount is the base coin
-                    
-                    // PAIR CONTRACT
-                    let pair_contract = CamelotPair::new(pair_address, client.clone());
+                let mint_details = MintDetails {
+                    amount_0,
+                    amount_1
+                };
 
-                    let token_0 = Address::from(pair_contract.token_0().call().await?);
-                    println!("token0: {:?}", token_0);
-
-                    let token_1 = Address::from(pair_contract.token_1().call().await?);
-                    println!("token1: {:?}", token_1);
-
-                    // We're subscribed to all Mint events so neither 
-                    // token is guaranteed to be our base coin
-                    // If/else over match for simplicity (no new scope)
-                    let (dmt_amount, other_coin_address) = if wdmt_address == token_0 {
-                        (amount_0, token_1)
-                    } else if wdmt_address == token_1 {
-                        (amount_1, token_0)
-                    } else {
-                        continue;
-                    };
-                    
-                    // CHECK MINIMUM AMOUNT OF BASE COIN RESERVES
-                    // if base_coin_amount > U256::from(10) * base_coin_decimals {
-
-                        // BET SIZING
-                        // let wallet_base_coin_balance = base_coin_contract
-                        // .balance_of(client.address())
-                        // .call()
-                        // .await?;
-
-                        // println!("wallet_base_coin_balance: {}", wallet_base_coin_balance);
-
-                        let wallet_dmt_balance = client
-                        .get_balance(client.address(), None)
-                        .await?;
-                
-                        println!("wallet_base_coin_balance: {}", wallet_dmt_balance);
-
-                        let dmt_amount_in = wallet_dmt_balance / 20;
-
-                        // SWAP THROUGH ROUTER
-                        let amounts_out = camelot_router_contract
-                            .get_amounts_out(
-                                dmt_amount_in,
-                                vec![wdmt_address, other_coin_address]
-                            )
-                            .call()
-                            .await?;
-
-                        println!("{:?}", amounts_out);
-
-                        let deadline = U256::from(get_epoch_milliseconds()) + U256::from(60 * 1000);
-
-                        println!("{:?}", deadline);
-
-                        let swap_receipt = camelot_router_contract
-                            .swap_exact_eth_for_tokens_supporting_fee_on_transfer_tokens(
-                                amounts_out[1]/2, 
-                                vec![wdmt_address, other_coin_address], 
-                                client.address(), 
-                                client.address(),
-                                deadline
-                            )
-                            .value(dmt_amount_in)
-                            .from(client.address())
-                            .gas(U256::from(1_000_000))
-                            .send()
-                            .await?
-                            .await?
-                            .expect("swapExactEthForTokensSupportingFeeOnTransferTokens() failed: no receipt found");
-
-                        println!("Router {} swapped for {}!\nreceipt: {:?}", camelot_router_address, other_coin_address, swap_receipt);
-                    // }
-
-                // }
+                if pair_created_pair_address_set.remove(&pair_address) {
+                    // EXECUTE TRADE
+                    trade_dmt_for_other(
+                        &client, 
+                        wdmt_address,
+                        wdmt_decimals,
+                        &camelot_router_contract,
+                        min_dmt_reserve,
+                        pair_address, 
+                        mint_details
+                    ).await?;
+                } else {
+                    // DEFER DETAILS FOR POSSIBLE LATER EXECUTION
+                    // MINT MAY SNEAK IN BEFORE PAIR CREATE (TWO STREAMS)
+                    pair_address_to_mint_details.insert(
+                        pair_address,
+                        mint_details
+                    ); 
+                }
             }
         }
+    }
+
+    Ok(())
+}
+
+struct MintDetails {
+    pub amount_0: U256,
+    pub amount_1: U256
+}
+
+async fn trade_dmt_for_other(
+    client: &Arc<SignerMiddleware<Arc<Provider<Ws>>, Wallet<SigningKey>>>,
+    wdmt_address: Address,
+    wdmt_decimals: u8,
+    camelot_router_contract: &CamelotRouter<SignerMiddleware<Arc<Provider<Ws>>, Wallet<SigningKey>>>,
+    min_dmt_reserve: U256,
+    pair_address: Address,
+    mint_details: MintDetails
+) -> eyre::Result<()> {
+    // PAIR CONTRACT
+    let pair_contract = CamelotPair::new(pair_address, client.clone());
+
+    let token_0 = Address::from(pair_contract.token_0().call().await?);
+    println!("token0: {:?}", token_0);
+
+    let token_1 = Address::from(pair_contract.token_1().call().await?);
+    println!("token1: {:?}", token_1);
+
+    // We're subscribed to all Mint events so neither 
+    // token is guaranteed to be our base coin
+    // If/else over match for simplicity (no new scope)
+    let (dmt_amount, other_coin_address) = if wdmt_address == token_0 {
+        (mint_details.amount_0, token_1)
+    } else if wdmt_address == token_1 {
+        (mint_details.amount_1, token_0)
+    } else {
+        return Ok(());
+    };
+    
+    // CHECK MINIMUM AMOUNT OF BASE COIN RESERVES
+
+    if dmt_amount > min_dmt_reserve {
+
+        // BET SIZING
+        let wallet_dmt_balance = client
+            .get_balance(client.address(), None)
+            .await?;
+
+        println!("wallet_base_coin_balance: {}", wallet_dmt_balance);
+
+        let dmt_amount_in = std::cmp::min(
+            U256::from(2) * U256::from(wdmt_decimals),
+            wallet_dmt_balance / 20
+        );
+
+        // SWAP THROUGH ROUTER
+        let amounts_out = camelot_router_contract
+            .get_amounts_out(
+                dmt_amount_in,
+                vec![wdmt_address, other_coin_address]
+            )
+            .call()
+            .await?;
+
+        println!("amounts_out: {:?}", amounts_out);
+
+        let deadline = U256::from(get_epoch_milliseconds()) + U256::from(60 * 1000);
+
+        println!("dealine: {:?}", deadline);
+
+        let swap_receipt = camelot_router_contract
+            .swap_exact_eth_for_tokens_supporting_fee_on_transfer_tokens(
+                amounts_out[1]/2, 
+                vec![wdmt_address, other_coin_address], 
+                client.address(), 
+                client.address(),
+                deadline
+            )
+            .value(dmt_amount_in)
+            .from(client.address())
+            .gas(U256::from(500_000))
+            .send()
+            .await?
+            .await?
+            .expect("swapExactEthForTokensSupportingFeeOnTransferTokens() failed: no receipt found");
+
+        println!("Swapped for {}!\nreceipt: {:?}", other_coin_address, swap_receipt);
+
     }
 
     Ok(())
