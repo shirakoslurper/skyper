@@ -112,8 +112,6 @@ struct Config {
     mnemonic_dir: PathBuf,
     #[clap(short = 'w', long, default_value = "wss://mainnet.sanko.xyz/ws")]
     ws_rpc_url: String,
-    #[clap(short = 'c', long, default_value = "1996")]
-    chain_id: u64
 }
 
 
@@ -133,7 +131,7 @@ async fn main() -> eyre::Result<()> {
     let provider = Arc::new(Provider::<Ws>::connect(config.ws_rpc_url).await?);
 
     // // CONNECT WALLET TO PROVIDER
-    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(config.chain_id)));
+    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(SANKO_CHAIN_ID)));
 
     // QUICK BLOCK NUMBER CHECK
     let block_number: U64 = provider.get_block_number().await?;
@@ -189,7 +187,7 @@ async fn main() -> eyre::Result<()> {
     println!("wallet_dmt_balance: {}", wallet_dmt_balance);
 
     // MIN DMT RESERVES
-    let min_dmt_reserve = U256::from(10) * U256::from(wdmt_decimals);
+    let min_dmt_reserve = U256::from(5) * U256::from(10).pow(U256::from(wdmt_decimals));
 
     let mut pair_created_pair_address_set = HashSet::new();
     let mut pair_address_to_mint_details = HashMap::new();
@@ -309,8 +307,8 @@ async fn trade_dmt_for_other(
         println!("wallet_base_coin_balance: {}", wallet_dmt_balance);
 
         let dmt_amount_in = std::cmp::min(
-            U256::from(2) * U256::from(wdmt_decimals),
-            wallet_dmt_balance / 20
+            U256::from(2) * U256::from(10).pow(U256::from(wdmt_decimals)),
+            wallet_dmt_balance / 10
         );
 
         // SWAP THROUGH ROUTER
@@ -326,7 +324,7 @@ async fn trade_dmt_for_other(
 
         let deadline = U256::from(get_epoch_milliseconds()) + U256::from(60 * 1000);
 
-        println!("dealine: {:?}", deadline);
+        println!("deadline: {:?}", deadline);
 
         let swap_receipt = camelot_router_contract
             .swap_exact_eth_for_tokens_supporting_fee_on_transfer_tokens(
