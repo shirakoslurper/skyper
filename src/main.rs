@@ -114,6 +114,12 @@ struct Config {
     ws_rpc_url: String,
 }
 
+// BLACKLIST ORIGIN ADDRESS
+const ORIGIN_ADDRESS_BLACKLIST: &'static [&'static str] = &[
+    "0xC372210d9BE396e86B5B0ff82aA87ED65752db19",
+
+];
+
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -147,16 +153,9 @@ async fn main() -> eyre::Result<()> {
     let camelot_router_address = CAMELOT_ROUTER_ADDRESS.parse::<Address>()?;
     let camelot_router_contract = CamelotRouter::new(camelot_router_address, client.clone());
 
-    // PAIRCREATED AND MINT FILTERS
-    // let token_topics = [
-    //     H256::from(wdmt_address)
-    // ];
-
     let pair_created_filter = Filter::new()
         .address(CAMELOT_POOL_FACTORY_ADDRESS.parse::<Address>()?)
         .event("PairCreated(address,address,address,uint256)");
-        // .topic1(token_topics.to_vec())
-        // .topic2(token_topics.to_vec());
 
     let mint_filter = Filter::new()
         .event("Mint(address,uint256,uint256)");
@@ -187,7 +186,7 @@ async fn main() -> eyre::Result<()> {
     println!("wallet_dmt_balance: {}", wallet_dmt_balance);
 
     // MIN DMT RESERVES
-    let min_dmt_reserve = U256::from(5) * U256::from(10).pow(U256::from(wdmt_decimals));
+    let min_dmt_reserve = U256::from(60) * U256::from(10).pow(U256::from(wdmt_decimals));
 
     let mut pair_created_pair_address_set = HashSet::new();
     let mut pair_address_to_mint_details = HashMap::new();
@@ -226,6 +225,8 @@ async fn main() -> eyre::Result<()> {
                 let pair_address = log.address;
 
                 println!("Mint:\n    pair_address: {}", pair_address);
+                // TODO: VALIDATE SENDER?
+                // let sender_address = Address::from(log.topics[1]);
 
                 let amount_0 = U256::from_big_endian(&log.data[0..32]);
                 let amount_1 = U256::from_big_endian(&log.data[32..64]);
@@ -296,7 +297,6 @@ async fn trade_dmt_for_other(
     };
     
     // CHECK MINIMUM AMOUNT OF BASE COIN RESERVES
-
     if dmt_amount > min_dmt_reserve {
 
         // BET SIZING
@@ -308,7 +308,7 @@ async fn trade_dmt_for_other(
 
         let dmt_amount_in = std::cmp::min(
             U256::from(2) * U256::from(10).pow(U256::from(wdmt_decimals)),
-            wallet_dmt_balance / 10
+            wallet_dmt_balance / 30
         );
 
         // SWAP THROUGH ROUTER
